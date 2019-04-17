@@ -23,23 +23,31 @@ public struct BasicModel: Layer {
 }
 
 public struct DataBunch<Element> where Element: TensorGroup{
-    public var train: Dataset<Element>
-    public var valid: Dataset<Element>
+    public var _train: Dataset<Element>
+    public var _valid: Dataset<Element>
+    public var shuffleTrain: Bool = true
+    public var shuffleValid: Bool = false
+    public var batchSize: Int = 64 
+    public var train: Dataset<Element> { return processDs(_train, shuffleTrain) }
+    public var valid: Dataset<Element> { return processDs(_valid, shuffleValid) }
     
-    public init(train: Dataset<Element>, valid: Dataset<Element>) {
-        self.train = train
-        self.valid = valid
+    private func processDs(_ ds: Dataset<Element>, _ shuffle: Bool) -> Dataset<Element>{
+        if !shuffle { return ds.batched(Int64(batchSize))}
+        let count = Int64(ds.count(where: {_ in true}))
+        return ds.batched(Int64(batchSize)).shuffled(sampleCount: count, randomSeed: Int64(random()))
+    }
+    
+    public init(train: Dataset<Element>, valid: Dataset<Element>, batchSize: Int = 64) {
+        (self._train, self._valid, self.batchSize)  = (train, valid, batchSize)
     }
 }
 
-// TODO: When TF-421 is fixed, switch this back to Int32 labels.
 public func mnistDataBunch(path: Path = mnistPath, flat: Bool = false, bs: Int = 64
-                          ) -> DataBunch<DataBatch<Tensor<Float>, Tensor<Float>>>{
+                          ) -> DataBunch<DataBatch<Tensor<Float>, Tensor<Int32>>>{
     let (xTrain,yTrain,xValid,yValid) = loadMNIST(path: path, flat: flat)
-    let yTrain1: Tensor<Float> = Raw.oneHot(indices: yTrain, depth: Tensor(10), onValue: Tensor(1.0), offValue: Tensor(0.0))
-    let yValid1: Tensor<Float> = Raw.oneHot(indices: yValid, depth: Tensor(10), onValue: Tensor(1.0), offValue: Tensor(0.0))
-    return DataBunch(train: Dataset(elements:DataBatch(xb:xTrain, yb:yTrain1)).batched(Int64(bs)), 
-                     valid: Dataset(elements:DataBatch(xb:xValid, yb:yValid1)).batched(Int64(bs)))
+    return DataBunch(train: Dataset(elements:DataBatch(xb:xTrain, yb:yTrain)), 
+                     valid: Dataset(elements:DataBatch(xb:xValid, yb:yValid)),
+                     batchSize: bs)
 }
 
 public enum LearnerAction: Error {
@@ -49,8 +57,7 @@ public enum LearnerAction: Error {
 }
 
 /// A model learner, responsible for initializing and training a model on a given dataset.
-// NOTE: When TF-421 is fixed, make `Label` not constrained to `Differentiable`.
-public final class Learner<Label: Differentiable & TensorGroup,
+public final class Learner<Label: TensorGroup,
                            Opt: TensorFlow.Optimizer & AnyObject>
     where Opt.Scalar: Differentiable,
           // Constrain model input to Tensor<Float>, to work around
@@ -69,9 +76,7 @@ public final class Learner<Label: Differentiable & TensorGroup,
     /// A wrapper class to hold the loss function, to work around
     // https://forums.fast.ai/t/fix-ad-crash-in-learner/42970.
     public final class LossFunction {
-        // NOTE: When TF-421 is fixed, replace with:
-        //public typealias F = @differentiable (Model.Output, @nondiff Label) -> Loss
-        public typealias F = @differentiable (Model.Output, Label) -> Loss
+        public typealias F = @differentiable (Model.Output, @nondiff Label) -> Loss
         public var f: F
         init(_ f: @escaping F) { self.f = f }
     }
@@ -125,10 +130,10 @@ public final class Learner<Label: Differentiable & TensorGroup,
         /// A closure which will be called upon the completion of training on a batch.
         open func batchDidFinish(learner: Learner) throws {}
         /// A closure which will be called when a new gradient has been computed.
-        open func learnerDidProduceNewGradient(learner: Learner) throws {}
+        open func didProduceNewGradient(learner: Learner) throws {}
         /// A closure which will be called upon the completion of an optimizer update.
         open func optimizerDidUpdate(learner: Learner) throws {}
-        
+        ///
         /// TODO: learnerDidProduceNewOutput and learnerDidProduceNewLoss need to
         /// be differentiable once we can have the loss function inside the Learner
     }
@@ -165,14 +170,19 @@ extension Learner {
     ///
     /// - Parameter batch: The batch of input data and labels to be trained on.
     ///
+    private func evaluate(onBatch batch: DataBatch<Input, Label>) throws {
+        currentOutput = model.applied(to: currentInput!, in: context)
+        currentLoss = lossFunction.f(currentOutput!, currentTarget!)
+    }
+    
     private func train(onBatch batch: DataBatch<Input, Label>) throws {
         let (xb,yb) = (currentInput!,currentTarget!)
-        (currentLoss, (currentGradient, _)) = model.valueWithGradient(at: yb) { (model, yb) -> Loss in 
-            let y = model.applied(to: xb, in: context)
+        (currentLoss, currentGradient) = model.valueWithGradient { model -> Loss in 
+            let y = model.applied(to: xb, in: context)                                      
             currentOutput = y
             return lossFunction.f(y, yb)
         }
-        try delegates.forEach { try $0.learnerDidProduceNewGradient(learner: self) }
+        try delegates.forEach { try $0.didProduceNewGradient(learner: self) }
         optimizer.update(&model.allDifferentiableVariables, along: self.currentGradient)
     }
     
@@ -182,7 +192,7 @@ extension Learner {
         for batch in ds {
             (currentInput, currentTarget) = (batch.xb, batch.yb)
             try delegates.forEach { try $0.batchWillStart(learner: self) }
-            do { try train(onBatch: batch) }
+            do { if inTrain { try train(onBatch: batch) } else { try evaluate(onBatch: batch) }}
             catch LearnerAction.skipBatch {}
             try delegates.forEach { try $0.batchDidFinish(learner: self) }
         }
@@ -216,25 +226,26 @@ extension Learner {
     public class TrainEvalDelegate: Delegate {
         public override func trainingWillStart(learner: Learner) {
             learner.pctEpochs = 0.0
-            learner.currentIter = 0
         }
 
         public override func epochWillStart(learner: Learner) {
             learner.pctEpochs = Float(learner.currentEpoch)
             learner.context = Context(learningPhase: .training)
             learner.inTrain = true
+            learner.currentIter = 0
         }
         
         public override func batchDidFinish(learner: Learner) {
+            learner.currentIter += 1
             if learner.inTrain{
                 learner.pctEpochs   += 1.0 / Float(learner.iterCount)
-                learner.currentIter += 1
             }
         }
         
         public override func validationWillStart(learner: Learner) {
             learner.context = Context(learningPhase: .inference)
             learner.inTrain = false
+            learner.currentIter = 0
         }
     }
     
@@ -265,17 +276,6 @@ extension Learner {
                         partials[i] += Float(bs) * metrics[i-1]((learner.currentOutput as! Tensor<Float>), target)
                     }
                 }
-                
-                // TODO: When TF-421 is fixed, remove this.
-                if let target = learner.currentTarget as? Tensor<Float>{
-                    let bs = target.shape[0]
-                    total += Int(bs)
-                    partials[0] += Float(bs) * learner.currentLoss
-                    let idxTarg = target.argmax(squeezingAxis: 1)
-                    for i in 1...metrics.count{
-                        partials[i] += Float(bs) * metrics[i-1]((learner.currentOutput as! Tensor<Float>), idxTarg)
-                    }
-                }
             }
         }
         
@@ -289,3 +289,23 @@ extension Learner {
         return AvgMetric(metrics: metrics)
     }
 }
+
+// TODO: make metrics more generic (probably for after the course)
+extension Learner {
+    public class Normalize: Delegate {
+        public let mean, std: Tensor<Float>
+        public init(mean: Tensor<Float>, std: Tensor<Float>){ 
+            (self.mean,self.std) = (mean,std)
+        }
+        
+        public override func batchWillStart(learner: Learner) {
+            learner.currentInput = (learner.currentInput! - mean) / std
+        }
+    }
+    
+    public func makeNormalize(mean: Tensor<Float>, std: Tensor<Float>) -> Normalize{
+        return Normalize(mean: mean, std: std)
+    }
+}
+
+public let mnistStats = (mean: Tensor<Float>(0.13066047), std: Tensor<Float>(0.3081079))

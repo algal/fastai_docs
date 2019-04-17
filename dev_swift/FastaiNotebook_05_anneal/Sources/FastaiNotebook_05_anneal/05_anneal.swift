@@ -8,8 +8,6 @@ import Path
 import TensorFlow
 
 import Python
-let plt = Python.import("matplotlib.pyplot")
-let np = Python.import("numpy")
 
 public func plot<S1, S2>(_ arr1: [S1], _ arr2: [S2], logScale:Bool = false, xLabel: String="", yLabel: String = "") 
     where S1:PythonConvertible, S2:PythonConvertible{
@@ -94,6 +92,7 @@ public struct ProgressBar{
     
     public mutating func update_bar(_ val: Int){
         lastVal = val
+        let prevLength = bar.count
         bar = String(repeating: fillChar, count: (val * length) / total)
         bar += String(repeating: "-", count: length - (val * length) / total)
         let pct = String(format: "%.2f", 100.0 * Float(val)/Float(total))
@@ -101,6 +100,7 @@ public struct ProgressBar{
         let remaingTime = estimatedTotal - elapsedTime
         bar += " \(pct)% [\(val)/\(total) \(formatTime(elapsedTime))<\(formatTime(remaingTime))"
         bar += comment.isEmpty ? "]" : " \(comment)]"
+        if bar.count < prevLength { bar += String(repeating: " ", count: prevLength-bar.count) }
         print(bar, terminator:"\r")
         fflush(stdout)
     }
@@ -118,24 +118,23 @@ extension Learner {
         
         public override func epochWillStart(learner: Learner) {
             pbar = ProgressBar(learner.data.train.count(where: {_ in true}))
-            iter = 0
-            pbar!.update(iter)
         }
         
         public override func validationWillStart(learner: Learner) {
             if pbar != nil { pbar!.remove() }
             pbar = ProgressBar(learner.data.valid.count(where: {_ in true}))
-            iter = 0
-            pbar!.update(iter)
         }
         
         public override func epochDidFinish(learner: Learner) {
             if pbar != nil { pbar!.remove() }
         }
         
+        public override func batchWillStart(learner: Learner) {
+            if learner.currentIter == 0 {pbar!.update(0)}
+        }
+        
         public override func batchDidFinish(learner: Learner) {
-            iter += 1
-            pbar!.update(iter)
+            pbar!.update(learner.currentIter)
         }
         
         public override func trainingDidFinish(learner: Learner) {
@@ -144,6 +143,29 @@ extension Learner {
     }
     
     public func makeShowProgress() -> ShowProgress { return ShowProgress() }
+}
+
+/// A non-generalized learning rate scheduler
+extension Learner where Opt.Scalar: BinaryFloatingPoint {
+    public class ParamScheduler: Delegate {
+        public override var order: Int { return 1 }
+        public typealias ScheduleFunc = (Float) -> Float
+
+        // A learning rate schedule from step to float.
+        public var scheduler: ScheduleFunc
+        
+        public init(scheduler: @escaping (Float) -> Float) {
+            self.scheduler = scheduler
+        }
+        
+        override public func batchWillStart(learner: Learner) {
+            learner.optimizer.learningRate = Opt.Scalar(scheduler(learner.pctEpochs/Float(learner.epochCount)))
+        }
+    }
+    
+    public func makeParamScheduler(scheduler: @escaping (Float) -> Float) -> ParamScheduler {
+        return ParamScheduler(scheduler: scheduler)
+    }
 }
 
 public func linearSchedule(start: Float, end: Float, pct: Float) -> Float {
