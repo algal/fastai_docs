@@ -4,7 +4,7 @@ import shutil
 src = Path('FastaiNotebooks/Sources/FastaiNotebooks')
 mods = sorted(list(src.iterdir()))
 
-pkg_tmpl = """// swift-tools-version:4.2
+pkg_tmpl = """// swift-tools-version:5.0
 import PackageDescription
 
 let package = Package(
